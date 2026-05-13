@@ -1,0 +1,5 @@
+pandas>=2.2
+pytest>=8.0
+# Note: we parse xlsx via stdlib zipfile + ElementTree (pipeline/load.py)
+# because the supplied xlsx files use a non-standard OOXML namespace that
+# openpyxl refuses to parse. No xlsx library needed.
