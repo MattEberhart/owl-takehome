@@ -89,49 +89,46 @@ def test_cumulative_return_query_matches_smoke_targets(db):
 
 
 def test_v2_migration_and_in_place_updates(db):
-    # First ingest v1 to set up baseline.
+    # Baseline: load v1.
     run_migrations(db)
     ingest(db, load_source(V1))
     pre_apple_close_sum = db.execute(
         "SELECT SUM(close_usd) FROM stock_price WHERE stock_id = "
         "(SELECT id FROM stock WHERE name = 'Apple')"
     ).fetchone()[0]
-
-    # Now bring in v2 — should auto-apply migration 0002 (added by the time
-    # this test runs) and upsert all rows. Same key set; no new rows.
     pre_count = _counts(db)
-    ingest(db, load_source(V2))  # ingest also called after migration applied below
-    # The test_pipeline runs against the current state of migrations/, so we
-    # also ensure run_migrations picks up 0002 here if it exists.
+
+    # Migrate to v2 schema and ingest the v2 source. With migration 0002
+    # present, run_migrations() in this pass is a no-op (already applied);
+    # the column was already added on the initial call above. ingest()
+    # picks up mktcap_usd because source has it and column exists.
     run_migrations(db)
-    # If migration 0002 just got applied, re-ingest so the mktcap column gets
-    # populated (executemany above ran before the column existed).
     ingest(db, load_source(V2))
 
     post_count = _counts(db)
     assert pre_count == post_count, 'v2 should not add or remove rows'
 
+    # Apple: close halved across every row -> sum is halved.
     post_apple_close_sum = db.execute(
         "SELECT SUM(close_usd) FROM stock_price WHERE stock_id = "
         "(SELECT id FROM stock WHERE name = 'Apple')"
     ).fetchone()[0]
-    # Apple's close is halved across every row → sum is halved.
     assert post_apple_close_sum == pytest.approx(pre_apple_close_sum / 2, rel=1e-6)
 
-    # Non-Apple stocks should be ~unchanged (within rounding tolerance).
-    for name in ['Amazon Com', 'Alphabet Class C', 'Facebook Class A']:
-        sum_close = db.execute(
-            "SELECT SUM(close_usd) FROM stock_price WHERE stock_id = "
-            "(SELECT id FROM stock WHERE name = ?)",
-            (name,),
-        ).fetchone()[0]
-        assert sum_close > 0, name
-
-    # mktcap_usd: column exists, all rows populated.
+    # mktcap_usd column exists and every row is populated.
     cols = {row[1] for row in db.execute('PRAGMA table_info(stock_price)')}
-    if 'mktcap_usd' in cols:
-        non_null = db.execute(
-            'SELECT COUNT(*) FROM stock_price WHERE mktcap_usd IS NOT NULL'
-        ).fetchone()[0]
-        total = db.execute('SELECT COUNT(*) FROM stock_price').fetchone()[0]
-        assert non_null == total
+    assert 'mktcap_usd' in cols
+    non_null = db.execute(
+        'SELECT COUNT(*) FROM stock_price WHERE mktcap_usd IS NOT NULL'
+    ).fetchone()[0]
+    total = db.execute('SELECT COUNT(*) FROM stock_price').fetchone()[0]
+    assert non_null == total
+
+    # Re-running ingest on v2 is still idempotent (row counts and SUMs stable).
+    ingest(db, load_source(V2))
+    assert _counts(db) == post_count
+    again = db.execute(
+        "SELECT SUM(close_usd) FROM stock_price WHERE stock_id = "
+        "(SELECT id FROM stock WHERE name = 'Apple')"
+    ).fetchone()[0]
+    assert again == post_apple_close_sum
