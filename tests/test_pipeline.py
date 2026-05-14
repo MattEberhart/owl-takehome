@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from pipeline.db import connect, run_migrations
@@ -132,3 +133,36 @@ def test_v2_migration_and_in_place_updates(db):
         "(SELECT id FROM stock WHERE name = 'Apple')"
     ).fetchone()[0]
     assert again == post_apple_close_sum
+
+
+def test_reclassification_produces_separate_assignment_rows(db):
+    """A stock that appears under two sectors in the same load should get
+    two stock_sector_assignment rows, each dated to that pair's earliest asof.
+    Models the 2018 GICS Facebook Tech → Communication Services move."""
+    run_migrations(db)
+    synthetic = pd.DataFrame([
+        # Facebook in Technology from 2012 to mid-2018.
+        {'name': 'Facebook', 'asof': '2012-05-18', 'volume': 1000, 'close_usd': 38.0,
+         'sector_level1': 'Technology', 'sector_level2': 'Software & IT Services'},
+        {'name': 'Facebook', 'asof': '2018-09-28', 'volume': 1500, 'close_usd': 164.0,
+         'sector_level1': 'Technology', 'sector_level2': 'Software & IT Services'},
+        # Then in Communication Services from 2018-10-01 onward.
+        {'name': 'Facebook', 'asof': '2018-10-01', 'volume': 1600, 'close_usd': 163.0,
+         'sector_level1': 'Communication Services', 'sector_level2': 'Interactive Media'},
+        {'name': 'Facebook', 'asof': '2023-11-06', 'volume': 2000, 'close_usd': 315.0,
+         'sector_level1': 'Communication Services', 'sector_level2': 'Interactive Media'},
+    ])
+    ingest(db, synthetic)
+
+    rows = db.execute(
+        "SELECT sec.level1, sec.level2, a.effective_from "
+        "FROM stock_sector_assignment a "
+        "JOIN sector sec ON sec.id = a.sector_id "
+        "JOIN stock s ON s.id = a.stock_id "
+        "WHERE s.name = 'Facebook' "
+        "ORDER BY a.effective_from"
+    ).fetchall()
+    assert rows == [
+        ('Technology', 'Software & IT Services', '2012-05-18'),
+        ('Communication Services', 'Interactive Media', '2018-10-01'),
+    ]

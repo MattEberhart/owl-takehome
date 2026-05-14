@@ -5,8 +5,10 @@ Idempotency strategy: UPSERT by natural key on every table.
   - stock: INSERT OR IGNORE on (name).
   - sector: INSERT OR IGNORE on (level1, level2).
   - stock_sector_assignment: INSERT OR IGNORE on (stock_id, effective_from).
-      effective_from = earliest asof for that stock in the current load.
-      If a later run shows a different sector, a new assignment row is added.
+      One row per unique (stock, sector) combination in the source.
+      effective_from = earliest asof for that (stock, sector) combination.
+      If a stock has multiple sectors across the timeline (reclassification),
+      each gets its own assignment row dated to its first appearance.
   - stock_price: INSERT ... ON CONFLICT(stock_id, asof) DO UPDATE with the
       new close_usd / volume / mktcap_usd. The mktcap_usd column is included
       only if the migration that added it has already run *and* the source
@@ -63,21 +65,24 @@ def ingest(conn: sqlite3.Connection, df: pd.DataFrame) -> dict[str, int]:
             for sid, l1, l2 in conn.execute('SELECT id, level1, level2 FROM sector')
         }
 
-        # 3. stock_sector_assignment — one row per (stock_id, effective_from).
-        #    effective_from = the earliest asof we see for that stock in this load.
-        earliest_by_name = df.groupby('name')['asof'].min().to_dict()
-        sector_by_name = (
-            df.drop_duplicates(subset=['name'])
-              .set_index('name')[['sector_level1', 'sector_level2']]
-              .to_dict(orient='index')
+        # 3. stock_sector_assignment — one row per unique (stock, sector) pair
+        #    seen in the source. effective_from = earliest asof for THAT
+        #    specific (stock, sector) combination, not the stock's overall
+        #    earliest asof. This is what makes the table correctly handle a
+        #    source that contains a mid-timeline GICS reclassification.
+        per_pair = (
+            df.groupby(['name', 'sector_level1', 'sector_level2'], as_index=False)['asof']
+              .min()
+              .rename(columns={'asof': 'effective_from'})
         )
-        assignment_rows = []
-        for name, earliest in earliest_by_name.items():
-            stock_id = stock_id_by_name[name]
-            l1 = sector_by_name[name]['sector_level1']
-            l2 = sector_by_name[name]['sector_level2']
-            sector_id = sector_id_by_pair[(l1, l2)]
-            assignment_rows.append((stock_id, sector_id, earliest))
+        assignment_rows = [
+            (
+                stock_id_by_name[r['name']],
+                sector_id_by_pair[(r['sector_level1'], r['sector_level2'])],
+                r['effective_from'],
+            )
+            for _, r in per_pair.iterrows()
+        ]
         cur = conn.executemany(
             'INSERT OR IGNORE INTO stock_sector_assignment '
             '  (stock_id, sector_id, effective_from) VALUES (?, ?, ?)',
